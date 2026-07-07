@@ -3303,35 +3303,43 @@ function fxSearchDateStr(offsetDays){
 // 한국수출입은행 Open API로 미국달러(USD) 환율을 가져온다.
 // 영업일 기준으로만 데이터가 있어서, 오늘자가 없으면 하루씩 과거로 최대 5일까지 재시도한다.
 //
-// ⚠ 이 API는 브라우저 직접 호출(CORS)을 막아두고 있어서, 직접 호출이 실패하면
-// 공개 CORS 우회 프록시(allorigins.win)를 한 번 거쳐서 재시도한다.
+// ⚠ 이 API는 브라우저 직접 호출(CORS)을 아예 막아두고 있어서, 공개 CORS 우회
+// 프록시를 여러 개 순서대로 시도한다(하나가 불안정해도 다음 것으로 넘어감).
 // 프록시를 거치면 요청(인증키 포함)이 제3자 서버를 지나가게 된다는 점을 참고할 것 —
-// 이 프록시는 우리가 관리하는 서비스가 아니라 신뢰도·가용성을 보장할 수 없다.
-const FX_CORS_PROXY = 'https://api.allorigins.win/raw?url=';
+// 이 프록시들은 우리가 관리하는 서비스가 아니라 신뢰도·가용성을 보장할 수 없다.
+const FX_CORS_PROXIES = [
+  url => 'https://api.allorigins.win/raw?url=' + encodeURIComponent(url),
+  url => 'https://corsproxy.io/?url=' + encodeURIComponent(url),
+  url => 'https://api.codetabs.com/v1/proxy?quest=' + encodeURIComponent(url),
+];
+
+async function fetchViaProxiesOrDirect(url){
+  const errors = [];
+  // 1) 직접 호출 시도
+  try{
+    const resp = await fetch(url);
+    if(!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    return await resp.json();
+  }catch(e){ errors.push(`직접호출: ${e.message}`); }
+
+  // 2) 프록시들을 순서대로 시도
+  for(let i=0; i<FX_CORS_PROXIES.length; i++){
+    try{
+      const proxyUrl = FX_CORS_PROXIES[i](url);
+      const resp = await fetch(proxyUrl);
+      if(!resp.ok) throw new Error(`HTTP ${resp.status}`);
+      return await resp.json();
+    }catch(e){ errors.push(`프록시${i+1}: ${e.message}`); }
+  }
+  throw new Error(errors.join(' / '));
+}
 
 async function fetchUsdKrwRate(apiKey){
   for(let back=0; back<=5; back++){
     const dateStr = fxSearchDateStr(-back);
     const directUrl = `${FX_API_BASE}?authkey=${encodeURIComponent(apiKey)}&searchdate=${dateStr}&data=AP01`;
 
-    let data = null;
-    try{
-      // 1) 직접 호출 시도
-      const resp = await fetch(directUrl);
-      if(!resp.ok) throw new Error(`HTTP ${resp.status}`);
-      data = await resp.json();
-    }catch(directErr){
-      // 2) 직접 호출 실패(대부분 CORS) → 프록시를 거쳐 재시도
-      try{
-        const proxyUrl = FX_CORS_PROXY + encodeURIComponent(directUrl);
-        const proxyResp = await fetch(proxyUrl);
-        if(!proxyResp.ok) throw new Error(`프록시 HTTP ${proxyResp.status}`);
-        data = await proxyResp.json();
-      }catch(proxyErr){
-        throw new Error(`직접 호출 실패(${directErr.message}) / 프록시도 실패(${proxyErr.message})`);
-      }
-    }
-
+    const data = await fetchViaProxiesOrDirect(directUrl);
     if(!Array.isArray(data)) throw new Error('예상치 못한 응답 형식');
     const usd = data.find(d=>d.cur_unit==='USD');
     if(usd && usd.deal_bas_r){
